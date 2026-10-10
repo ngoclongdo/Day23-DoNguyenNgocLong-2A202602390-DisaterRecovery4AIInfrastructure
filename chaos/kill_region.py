@@ -31,9 +31,15 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import time
 
 import httpx
+
+# Windows compatibility for signals
+SIGSTOP = getattr(signal, "SIGSTOP", getattr(signal, "SIGTERM", 15))
+SIGKILL = getattr(signal, "SIGKILL", getattr(signal, "SIGTERM", 15))
+SIGCONT = getattr(signal, "SIGCONT", None)
 
 EVENTS = pathlib.Path("chaos/chaos-events.jsonl")
 PID_DIR = pathlib.Path("run")
@@ -96,7 +102,7 @@ def kill(region: str, mode: str, backend: str, force_both: bool, mock: bool):
         # netblock: SIGSTOP -> TCP handshake vẫn xong nhưng không ai trả lời => request TREO
         #           (đúng hành vi của iptables DROP ở tầng app)
         # stop    : SIGKILL -> cổng đóng => ConnectError ngay
-        os.kill(pid, signal.SIGSTOP if mode == "netblock" else signal.SIGKILL)
+        os.kill(pid, SIGSTOP if mode == "netblock" else SIGKILL)
     else:
         svc = f"serving-{region}"
         if mode == "stop":
@@ -110,8 +116,8 @@ def kill(region: str, mode: str, backend: str, force_both: bool, mock: bool):
 def restore(region: str, backend: str):
     if backend == "bare":
         pid = pid_of(region)
-        if pid:
-            os.kill(pid, signal.SIGCONT)
+        if pid and SIGCONT is not None:
+            os.kill(pid, SIGCONT)
             return event(action="restore", region=region, method="SIGCONT", pid=pid)
         return event(action="restore", region=region, method="need_manual_start",
                      note="process da bi SIGKILL, chay `make up-bare` lai")

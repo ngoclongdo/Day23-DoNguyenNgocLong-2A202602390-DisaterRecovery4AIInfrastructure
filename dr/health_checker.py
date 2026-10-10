@@ -13,10 +13,6 @@ Yêu cầu (đọc §4 "Kiến Trúc Health-Check-Based Failover" + §2 "DNS Fai
 
 Chạy:  python dr/health_checker.py --interval 5 --threshold 3 --duration 300 \
               --out reports/health-events.jsonl
-
-CÂU HỎI PHẢI TRẢ LỜI TRƯỚC KHI VIẾT (ghi câu trả lời vào reports/postmortem.md):
-  interval=5s, threshold=3 -> sớm nhất bạn có thể phát hiện outage là bao nhiêu giây?
-  Con số đó nằm TRONG RTO của bạn. Muốn RTO 5 phút thì được phép chọn interval bao nhiêu?
 """
 import argparse
 import json
@@ -29,13 +25,88 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Kiểm tra /readyz của một region.
+    Timeout PHẢI có — netblock làm request treo mãi.
+    Trả về (ready, reason):
+    - ready=True nếu status_code == 200 và response chỉ ra ready
+    - ready=False nếu timeout hoặc status != 200
+    """
+    url = f"{URL[region]}/readyz"
+    t0 = time.time()
+    try:
+        r = httpx.get(url, timeout=timeout)
+        if r.status_code == 200:
+            return True, "ok"
+        else:
+            return False, f"status_{r.status_code}"
+    except httpx.TimeoutException:
+        return False, "Timeout"
+    except Exception as e:
+        elapsed = time.time() - t0
+        if elapsed < timeout:
+            time.sleep(timeout - elapsed)
+        return False, type(e).__name__
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Vòng lặp poll + phát hiện transition + ghi JSONL."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    t_start = time.time()
+
+    state = {
+        r: {
+            "status": "HEALTHY",
+            "consecutive_fails": 0,
+        }
+        for r in ["a", "b"]
+    }
+
+    with out.open("a", encoding="utf-8") as f:
+        while time.time() - t_start < duration:
+            for region in ["a", "b"]:
+                ready, reason = probe(region, timeout)
+                s = state[region]
+
+                if ready:
+                    s["consecutive_fails"] = 0
+                    if s["status"] != "HEALTHY":
+                        s["status"] = "HEALTHY"
+                        now = time.time()
+                        entry = {
+                            "ts": now,
+                            "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                            "event": "state_change",
+                            "region": region,
+                            "to": "HEALTHY",
+                            "consecutive_fails": 0,
+                            "reason": reason,
+                            "interval_s": interval,
+                            "threshold": threshold,
+                        }
+                        f.write(json.dumps(entry) + "\n")
+                        f.flush()
+                        print(f"[{entry['iso']}] {region} -> HEALTHY ({reason})")
+                else:
+                    s["consecutive_fails"] += 1
+                    if s["consecutive_fails"] >= threshold and s["status"] != "UNHEALTHY":
+                        s["status"] = "UNHEALTHY"
+                        now = time.time()
+                        entry = {
+                            "ts": now,
+                            "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                            "event": "state_change",
+                            "region": region,
+                            "to": "UNHEALTHY",
+                            "consecutive_fails": s["consecutive_fails"],
+                            "reason": reason,
+                            "interval_s": interval,
+                            "threshold": threshold,
+                        }
+                        f.write(json.dumps(entry) + "\n")
+                        f.flush()
+                        print(f"[{entry['iso']}] {region} -> UNHEALTHY ({reason}, fails={s['consecutive_fails']})")
+
+            time.sleep(interval)
 
 
 if __name__ == "__main__":

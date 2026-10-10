@@ -1,0 +1,1 @@
+{"ts": 1791649855.8572578, "iso": "2026-10-10T16:30:55", "action": "kill", "region": "a", "mode": "netblock", "backend": "bare", "mock": true, "other_region": "b", "other_alive": true, "forced_both": false, "note": "t_outage_start \u2014 moc 0 cua RTO clock"}
