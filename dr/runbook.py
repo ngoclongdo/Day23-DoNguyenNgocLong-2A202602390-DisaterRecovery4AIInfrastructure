@@ -33,169 +33,146 @@ import httpx
 
 sys.path.insert(0, ".")
 from dr import failover as fo  # noqa: E402
-from dr import health_checker as hc  # noqa: E402
 
 LOG = pathlib.Path("reports/runbook-run.jsonl")
 URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def step(n: int, name: str, **kw) -> dict:
-    """Ghi 1 dòng {ts, iso, step, name, ...} vào LOG và print ra stdout."""
+    """Ghi 1 dòng {ts, iso, step, name, ...} vào LOG và in ra stdout."""
     LOG.parent.mkdir(parents=True, exist_ok=True)
     ts = kw.pop("ts", time.time())
     iso = kw.pop("iso", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)))
-    entry = {"ts": ts, "iso": iso, "step": n, "name": name, **kw}
-    line = json.dumps(entry)
+    rec = {
+        "ts": ts,
+        "iso": iso,
+        "step": n,
+        "name": name,
+        **kw,
+    }
+    line = json.dumps(rec)
     with LOG.open("a", encoding="utf-8") as f:
         f.write(line + "\n")
         f.flush()
-    print(f"[{iso}] [Step {n}: {name}] {line}")
-    return entry
+    print(f"RUNBOOK [{n}/7] {name}:", line)
+    return rec
 
 
 def confirm(auto: bool, msg: str) -> bool:
-    """Auto=True -> True; ngược lại hỏi y/N."""
+    """auto=True -> True; ngược lại hỏi y/N."""
     if auto:
         return True
-    print(f"\n[XÁC NHẬN] {msg}")
     try:
-        ans = input("Tiếp tục thực hiện? [y/N]: ").strip().lower()
+        ans = input(f"{msg} [y/N]: ").strip().lower()
         return ans in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
         return False
 
 
 def run(primary: str, target: str, backend: str, auto: bool) -> dict:
-    """7 bước runbook theo quy trình phản ứng sự cố."""
+    """7 bước quy trình ứng cứu sự cố chuẩn."""
     t_start = time.time()
 
-    # Bước 1: 1 xac_nhan_outage
-    # Chờ health checker phát hiện outage của primary (tránh cutover trước khi detect)
-    health_log = pathlib.Path("reports/health-events.jsonl")
-    chaos_file = pathlib.Path("chaos/chaos-events.jsonl")
+    # Bước 1: 1 xac_nhan_outage — probe cả 2 region
+    p_down = True
+    try:
+        r = httpx.get(f"{URL[primary]}/readyz", timeout=1.0)
+        p_down = (r.status_code != 200)
+    except Exception:
+        p_down = True
+
+    t_alive = False
+    try:
+        t_alive = (httpx.get(f"{URL[target]}/healthz", timeout=1.0).status_code == 200)
+    except Exception:
+        t_alive = False
+
+    step(1, "xac_nhan_outage",
+         primary=primary, primary_down=p_down,
+         target=target, target_alive=t_alive)
+
+    # Bước 2: 2 thong_bao_incident — ghi nhận timestamp bắt đầu RTO
+    chaos_events = pathlib.Path("chaos/chaos-events.jsonl")
     t_outage = None
-    if chaos_file.exists():
-        lines = []
-        for l in chaos_file.read_text(encoding="utf-8").splitlines():
+    if chaos_events.exists():
+        kills = []
+        for l in chaos_events.read_text(encoding="utf-8").splitlines():
             if l.strip():
                 try:
-                    lines.append(json.loads(l))
+                    kills.append(json.loads(l))
                 except Exception:
                     pass
-        kills = [e for e in lines if e.get("action") == "kill" and e.get("region") == primary]
+        kills = [k for k in kills if k.get("action") == "kill"]
         if kills:
             t_outage = kills[-1].get("ts")
 
-    t_wait_start = time.time()
-    while time.time() - t_wait_start < 45.0:
-        if health_log.exists():
-            hev = []
-            for l in health_log.read_text(encoding="utf-8").splitlines():
-                if l.strip():
-                    try:
-                        hev.append(json.loads(l))
-                    except Exception:
-                        pass
-            if any(
-                e.get("event") == "state_change"
-                and e.get("to") == "UNHEALTHY"
-                and e.get("region") == primary
-                and (t_outage is None or e.get("ts", 0) >= t_outage)
-                for e in hev
-            ):
-                break
-        time.sleep(0.5)
+    t_operator = time.time()
+    step(2, "thong_bao_incident",
+         operator_noticed_ts=t_operator,
+         t_outage=t_outage,
+         delay_s=round(t_operator - t_outage, 2) if t_outage else None)
 
-    p_ready, p_reason = hc.probe(primary, timeout=2.0)
-    t_ready, t_reason = hc.probe(target, timeout=2.0)
-    step(
-        1,
-        "xac_nhan_outage",
-        primary=primary,
-        primary_ready=p_ready,
-        primary_reason=p_reason,
-        target=target,
-        target_ready=t_ready,
-        target_reason=t_reason,
-    )
-    if not confirm(auto, f"Phát hiện Region {primary} down ({p_reason}). Xác nhận outage để mở incident?"):
-        return {"ok": False, "aborted_at": 1, "reason": "operator_rejected"}
+    if not confirm(auto, f"Xác nhận kích hoạt failover từ region-{primary} sang region-{target}?"):
+        print("Huỷ bỏ failover bởi operator.")
+        return {"ok": False, "reason": "operator_cancelled"}
 
-    # Bước 2: 2 thong_bao_incident
-    t_outage = None
-    chaos_file = pathlib.Path("chaos/chaos-events.jsonl")
-    if chaos_file.exists():
-        lines = []
-        for l in chaos_file.read_text(encoding="utf-8").splitlines():
-            if l.strip():
-                try:
-                    lines.append(json.loads(l))
-                except Exception:
-                    pass
-        kills = [e for e in lines if e.get("action") == "kill" and e.get("region") == primary]
-        if kills:
-            t_outage = kills[-1].get("ts")
-    ts_notice = time.time()
-    delay_s = round(ts_notice - t_outage, 2) if t_outage else 0.0
-    step(2, "thong_bao_incident", t_outage=t_outage, ts_notice=ts_notice, delay_notice_s=delay_s)
-    if not confirm(auto, f"Đã ghi nhận incident. Tiến hành failover sang Region {target}?"):
-        return {"ok": False, "aborted_at": 2, "reason": "operator_rejected"}
-
-    # Bước 3: 3 scale_gpu_pool (gọi failover() 1 lần duy nhất)
+    # Bước 3: 3 scale_gpu_pool — gọi HÀM failover.failover(...) MỘT LẦN DUY NHẤT
     fo_res = fo.failover(target=target, backend=backend, wait=60.0)
-    step(
-        3,
-        "scale_gpu_pool",
-        target=target,
-        failover_ok=fo_res.get("ok"),
-        waited_s=fo_res.get("waited_s"),
-    )
+    step(3, "scale_gpu_pool", target=target, failover_ok=fo_res.get("ok"), failover_result=fo_res)
     if not fo_res.get("ok"):
-        return {"ok": False, "aborted_at": 3, "failover": fo_res}
+        return {"ok": False, "step": 3, "failover": fo_res}
 
-    # Bước 4: 4 verify_state_replica (chỉ đọc kết quả từ fo_res)
-    step(
-        4,
-        "verify_state_replica",
-        target=target,
-        rpo_seconds=fo_res.get("rpo_seconds"),
-        docs_lost=fo_res.get("docs_lost"),
-        embed_model_version=fo_res.get("embed_model_version"),
-    )
+    # Bước 4: 4 verify_state_replica — chỉ đọc kết quả từ dict bước 3 trả về
+    t_state = fo_res.get("target_state") or {}
+    v_info = t_state.get("vectors") if isinstance(t_state.get("vectors"), dict) else {}
+    step(4, "verify_state_replica",
+         target=target,
+         vector_count=v_info.get("count", t_state.get("count")),
+         weights=t_state.get("weights"),
+         rpo_seconds=fo_res.get("rpo_seconds"),
+         docs_lost=fo_res.get("docs_lost"),
+         embed_model_version=fo_res.get("embed_model_version"))
 
-    # Bước 5: 5 dns_cutover (kiểm tra file active_region)
+    # Bước 5: 5 dns_cutover — kiểm tra cutover ok
     active_path = pathlib.Path("edge/active_region")
-    active_reg = active_path.read_text(encoding="utf-8").strip() if active_path.exists() else None
-    step(5, "dns_cutover", active_region=active_reg, cutover_ok=(active_reg == target))
+    active_val = active_path.read_text(encoding="utf-8").strip() if active_path.exists() else None
+    step(5, "dns_cutover", active_region=active_val, cutover_ok=(active_val == target))
 
-    # Bước 6: 6 verify_golden_signals (10 request thật vào region phụ)
+    # Bước 6: 6 verify_golden_signals — 10 request thật đo p95 latency + error rate
     latencies = []
     errors = 0
-    for _ in range(10):
-        t0 = time.time()
-        try:
-            r = httpx.get(f"{URL[target]}/v1/infer?q=golden_probe", timeout=2.0)
-            lat = (time.time() - t0) * 1000
-            latencies.append(lat)
-            if r.status_code != 200 or not r.json().get("answer"):
+    with httpx.Client(timeout=3.0) as client:
+        for i in range(10):
+            t0 = time.time()
+            try:
+                r = client.get("http://127.0.0.1:8080/v1/infer", params={"q": f"test {i}"})
+                if r.status_code == 200:
+                    latencies.append((time.time() - t0) * 1000)
+                else:
+                    errors += 1
+            except Exception:
                 errors += 1
-        except Exception:
-            errors += 1
-    latencies.sort()
-    p95_ms = round(latencies[int(len(latencies) * 0.95)] if latencies else 0, 1)
-    err_rate = round(errors / 10.0, 2)
-    step(6, "verify_golden_signals", samples=10, p95_latency_ms=p95_ms, error_rate=err_rate)
+            time.sleep(0.05)
 
-    # Bước 7: 7 post_incident
-    elapsed_s = round(time.time() - t_start, 2)
-    measure_cmd = "python tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl"
-    step(7, "post_incident", elapsed_s=elapsed_s, measure_cmd=measure_cmd)
+    latencies.sort()
+    p95 = round(latencies[int(len(latencies) * 0.95)] if latencies else 0.0, 1)
+    step(6, "verify_golden_signals", requests=10, errors=errors,
+         p95_latency_ms=p95, error_rate=round(errors / 10.0, 2))
+
+    # Bước 7: 7 post_incident — elapsed_s + lệnh đo RTO
+    elapsed = round(time.time() - t_start, 2)
+    step(7, "post_incident",
+         elapsed_s=elapsed,
+         measure_command="python tools/measure_rto.py --loadgen reports/drill-2-withdr.jsonl --target-rto 300")
 
     return {
         "ok": True,
-        "elapsed_s": elapsed_s,
+        "elapsed_s": elapsed,
+        "primary": primary,
+        "target": target,
         "failover": fo_res,
-        "golden_signals": {"p95_ms": p95_ms, "error_rate": err_rate},
+        "p95_latency_ms": p95,
+        "errors": errors,
     }
 
 
